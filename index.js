@@ -6,6 +6,9 @@ const mongoose = require("mongoose");
 mongoose.set("strictQuery", false);
 const Book = require("./models/book");
 const Author = require("./models/author");
+const User = require("./models/user");
+const { GraphQLError } = require("graphql");
+const jwt = require("jsonwebtoken");
 
 require("dotenv").config();
 
@@ -119,6 +122,17 @@ let books = [
 */
 
 const typeDefs = `
+type User {
+  username: String!
+  favoriteGenre: String!
+  id: ID!
+}
+
+type Token {
+  value: String!
+}
+
+
   type Book {
     title: String!
     published: Int!
@@ -146,10 +160,21 @@ const typeDefs = `
         name:String!
         setBornTo: Int!
     ): Author
+
+     createUser(
+    username: String!
+    favoriteGenre: String!
+  ): User
+
+  login(
+    username: String!
+    password: String!
+  ): Token
   
 }
 
   type Query{
+    me: User
     bookCount: Int!
     authorCount: Int!
     allBooks(author: String, genre: String): [Book!]!
@@ -159,46 +184,78 @@ const typeDefs = `
 
 const resolvers = {
   Query: {
+    me: (root, args, context) => {
+      return context.currentUser;
+    },
     bookCount: async () => Book.collection.countDocuments(),
     authorCount: async () => Author.collection.countDocuments(),
     allBooks: async (root, args) => {
       let author_filter = {};
-      let genre_filter = {}
+      let genre_filter = {};
       if (args.author) {
-        author_filter = {name: args.author }
+        author_filter = { name: args.author };
       }
       if (args.genre) {
-        genre_filter =  {genres: { $elemMatch: { $eq: args.genre}}} 
-           }
-      console.log(author_filter)
-      console.log(genre_filter)
-      const books = await Book.find(genre_filter).populate({
-        path:"author", 
-        match: author_filter,
-        select: "name born"
+        genre_filter = { genres: { $elemMatch: { $eq: args.genre } } };
       }
-      );
+      console.log(author_filter);
+      console.log(genre_filter);
+      const books = await Book.find(genre_filter).populate({
+        path: "author",
+        match: author_filter,
+        select: "name born",
+      });
       console.log(books);
       return books.filter((b) => b.author);
     },
     allAuthors: async () => Author.find({}),
   },
   Mutation: {
-    addBook: async (root, args) => {
+    addBook: async (root, args, { currentUser }) => {
+      //Check logged in.
+      if (!currentUser) {
+        throw new GraphQLError("not authenticated", {
+          extensions: {
+            code: "BAD_USER_INPUT",
+          },
+        });
+      }
+
       let author = await Author.find({ name: args.author });
       if (author.length == 0) {
         author = new Author({ name: args.author });
         console.log(`new author: ${author}`);
-        await author.save();
+        try {
+          await author.save();
+        } catch (error) {
+          console.log("throwing author error");
+          throw new GraphQLError("Saving New Author from Book failed", {
+            extensions: {
+              code: "BAD_USER_INPUT",
+              invalidArgs: args.author,
+              error,
+            },
+          });
+        }
       } else {
         console.log(`old author: ${author}`);
         author = new Author(...author);
         console.log(`old author: ${author}`);
       }
-      console.log("reached here");
-
       const book = new Book({ ...args, author: author }); // id: uuid()}
-      return book.save();
+      try {
+        await book.save();
+      } catch (error) {
+        console.log("throwing book error");
+        throw new GraphQLError("Saving Book failed", {
+          extensions: {
+            code: "BAD_USER_INPUT",
+            invalidArgs: args,
+            error,
+          },
+        });
+      }
+      return book;
 
       /* books = books.concat(book)
         if (authors.filter((a) => a.name === book.author).length==0){
@@ -206,14 +263,57 @@ const resolvers = {
         }
         return book */
     },
-    editAuthor: async (root, args) => {
-      return Author.findOneAndUpdate({name: args.name},{born:args.setBornTo},{new:true})
-     
+    editAuthor: async (root, args, { currentUser }) => {
+      //Check logged in.
+      if (!currentUser) {
+        throw new GraphQLError("not authenticated", {
+          extensions: {
+            code: "BAD_USER_INPUT",
+          },
+        });
+      }
+
+      return Author.findOneAndUpdate(
+        { name: args.name },
+        { born: args.setBornTo },
+        { new: true }
+      );
+    },
+    createUser: async (root, args) => {
+      const user = new User({ username: args.username, favoriteGenre: args.favoriteGenre });
+
+      return user.save().catch((error) => {
+        throw new GraphQLError("Creating the user failed", {
+          extensions: {
+            code: "BAD_USER_INPUT",
+            invalidArgs: args.username,
+            error,
+          },
+        });
+      });
+    },
+    login: async (root, args) => {
+      const user = await User.findOne({ username: args.username });
+
+      if (!user || args.password !== "secret") {
+        throw new GraphQLError("wrong credentials", {
+          extensions: {
+            code: "BAD_USER_INPUT",
+          },
+        });
+      }
+
+      const userForToken = {
+        username: user.username,
+        id: user._id,
+      };
+
+      return { value: jwt.sign(userForToken, process.env.JWT_SECRET) };
     },
   },
 
   Author: {
-    bookCount: (root) => Book.collection.countDocuments({author: root._id})
+    bookCount: (root) => Book.collection.countDocuments({ author: root._id }),
   },
 };
 
@@ -224,6 +324,17 @@ const server = new ApolloServer({
 
 startStandaloneServer(server, {
   listen: { port: 4000 },
+  context: async ({ req, res }) => {
+    const auth = req ? req.headers.authorization : null;
+    if (auth && auth.startsWith("Bearer ")) {
+      const decodedToken = jwt.verify(
+        auth.substring(7),
+        process.env.JWT_SECRET
+      );
+      const currentUser = await User.findById(decodedToken.id);
+      return { currentUser };
+    }
+  },
 }).then(({ url }) => {
   console.log(`Server ready at ${url}`);
 });
